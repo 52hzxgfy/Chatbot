@@ -18,6 +18,7 @@ import { GroqService } from '@/lib/groq';
 import { Chat } from '@/components/chat';
 import { ChatPoolManager } from '@/lib/chatPoolManager';
 import { QwenService } from '@/lib/qwen';
+import { extractTimeRange } from '@/lib/utils';
 
 export function Page() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
@@ -166,17 +167,40 @@ export function Page() {
 
         const geminiService = chatInstance.service as GeminiService;
         
-        // 根据文件类型选择处理方法
-        if (selectedFile.type.startsWith('audio/')) {
-          response = await geminiService.processAudio(
-            selectedFile,
-            inputMessage || "请分析这个音频文件的内容"
-          );
-        } else {
-          response = await geminiService.processFile(
-            selectedFile,
-            inputMessage || "请分析这个文件的内容"
-          );
+        try {
+          // 根据文件类型选择处理方法
+          if (selectedFile.type.startsWith('audio/')) {
+            response = await geminiService.processAudio(
+              selectedFile,
+              inputMessage || "请分析这个音频文件的内容",
+              {
+                transcribe: inputMessage.toLowerCase().includes('转录'),
+                timeRange: extractTimeRange(inputMessage)
+              }
+            );
+          } else {
+            response = await geminiService.processFile(
+              selectedFile,
+              inputMessage || "请分析这个文件的内容"
+            );
+          }
+
+          // 如果是大文件，添加清理定时器
+          if (selectedFile.size > 20 * 1024 * 1024) {
+            setTimeout(async () => {
+              try {
+                const files = await geminiService.listFiles();
+                for (const file of files) {
+                  await geminiService.deleteFile(file.name);
+                }
+              } catch (error) {
+                console.error('Failed to cleanup files:', error);
+              }
+            }, 47 * 60 * 60 * 1000); // 47小时后清理
+          }
+        } catch (error) {
+          console.error('File processing error:', error);
+          throw error;
         }
       } else {
         // 普通文本消息处理，添加系统提示词支持
@@ -233,7 +257,7 @@ export function Page() {
     const file = event.target.files?.[0];
     if (!file) return;
     
-    // 验证文��类型
+    // 验证文类型
     const supportedTypes = [
       // 图片类型
       'image/png',
@@ -322,7 +346,7 @@ export function Page() {
     }
   };
 
-  // ���组件加载时读取保存的API密钥
+  // 组件加载时读取保存的API密钥
   useEffect(() => {
     const savedKeys = localStorage.getItem('apiKeys');
     if (savedKeys) {

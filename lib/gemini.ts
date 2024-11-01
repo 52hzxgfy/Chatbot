@@ -6,6 +6,8 @@ export class GeminiService {
   private model: GenerativeModel;
   private chat: ChatSession;
   private history: ChatHistoryMessage[] = [];
+  private static readonly FILE_API_ENDPOINT = 'https://generativelanguage.googleapis.com/v1/files';
+  private fileCache: Map<string, {uri: string, expiresAt: number}>;
 
   constructor(apiKey: string) {
     this.genAI = new GoogleGenerativeAI(apiKey);
@@ -17,6 +19,8 @@ export class GeminiService {
       }
     });
     this.chat = this.model.startChat();
+    this.history = [];
+    this.fileCache = new Map();
   }
 
   async testConnection(): Promise<boolean> {
@@ -142,23 +146,9 @@ export class GeminiService {
 
   async processFile(file: File, prompt: string): Promise<string> {
     try {
+      // 对于大文件使用File API
       if (file.size > 20 * 1024 * 1024) {
-        const uploadResponse = await fetch(
-          `https://generativelanguage.googleapis.com/v1/files:upload?key=${this.genAI.apiKey}`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': file.type,
-            },
-            body: file
-          }
-        );
-
-        if (!uploadResponse.ok) {
-          throw new Error('Failed to upload file');
-        }
-
-        const uploadData = await uploadResponse.json();
+        const { uri } = await this.uploadFile(file);
         
         const result = await this.model.generateContent([
           {
@@ -166,7 +156,7 @@ export class GeminiService {
           } as Part,
           {
             fileData: {
-              fileUri: uploadData.uri,
+              fileUri: uri,
               mimeType: file.type
             }
           } as Part
@@ -175,6 +165,7 @@ export class GeminiService {
         const response = await result.response;
         return response.text();
       } else {
+        // 小文件使用内联数据
         const base64Data = await this.fileToBase64(file);
         
         const fileData: FileData = {
@@ -202,7 +193,10 @@ export class GeminiService {
     }
   }
 
-  async processAudio(file: File, prompt: string): Promise<string> {
+  async processAudio(file: File, prompt: string, options?: {
+    transcribe?: boolean;
+    timeRange?: { start: string; end: string; }
+  }): Promise<string> {
     try {
       const supportedAudioTypes = [
         'audio/wav',
@@ -214,34 +208,63 @@ export class GeminiService {
       ];
 
       if (!supportedAudioTypes.includes(file.type)) {
-        throw new Error('Unsupported audio format. Supported formats are: WAV, MP3, AIFF, AAC, OGG, FLAC');
+        throw new Error('Unsupported audio format');
       }
 
       const duration = await this.getAudioDuration(file);
-      if (duration > 34200) { // 9.5小时 = 34200秒
+      if (duration > 34200) {
         throw new Error('Audio file is too long. Maximum duration is 9.5 hours.');
       }
 
-      const base64Data = await this.fileToBase64(file);
-      
-      const fileData: FileData = {
-        inlineData: {
-          data: base64Data,
-          mimeType: file.type
-        }
-      };
+      // 构建提示
+      let finalPrompt = prompt;
+      if (options?.transcribe) {
+        finalPrompt = 'Generate a transcript of the audio. ' + prompt;
+      }
+      if (options?.timeRange) {
+        finalPrompt += ` Focus on the section from ${options.timeRange.start} to ${options.timeRange.end}.`;
+      }
 
-      const result = await this.model.generateContent([
-        {
-          text: prompt
-        } as Part,
-        {
-          fileData
-        } as unknown as Part
-      ]);
-      
-      const response = await result.response;
-      return response.text();
+      // 对于大文件使用File API
+      if (file.size > 20 * 1024 * 1024) {
+        const { uri } = await this.uploadFile(file);
+        
+        const result = await this.model.generateContent([
+          {
+            text: finalPrompt
+          } as Part,
+          {
+            fileData: {
+              fileUri: uri,
+              mimeType: file.type
+            }
+          } as Part
+        ]);
+
+        const response = await result.response;
+        return response.text();
+      } else {
+        const base64Data = await this.fileToBase64(file);
+        
+        const fileData: FileData = {
+          inlineData: {
+            data: base64Data,
+            mimeType: file.type
+          }
+        };
+
+        const result = await this.model.generateContent([
+          {
+            text: finalPrompt
+          } as Part,
+          {
+            fileData
+          } as unknown as Part
+        ]);
+
+        const response = await result.response;
+        return response.text();
+      }
     } catch (error) {
       console.error('Audio processing error:', error);
       throw error;
@@ -317,6 +340,58 @@ export class GeminiService {
       xhr.open('POST', `https://generativelanguage.googleapis.com/v1/files:upload?key=${this.genAI.apiKey}`);
       xhr.send(formData);
     });
+  }
+
+  async uploadFile(file: File): Promise<{uri: string, name: string}> {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await fetch(`${GeminiService.FILE_API_ENDPOINT}:upload?key=${this.genAI.apiKey}`, {
+      method: 'POST',
+      body: formData
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to upload file');
+    }
+
+    const data = await response.json();
+    // 缓存文件URI，48小时后过期
+    this.fileCache.set(data.name, {
+      uri: data.uri,
+      expiresAt: Date.now() + 48 * 60 * 60 * 1000
+    });
+    
+    return {
+      uri: data.uri,
+      name: data.name
+    };
+  }
+
+  async deleteFile(name: string): Promise<void> {
+    const response = await fetch(
+      `${GeminiService.FILE_API_ENDPOINT}/${name}?key=${this.genAI.apiKey}`,
+      { method: 'DELETE' }
+    );
+    
+    if (!response.ok) {
+      throw new Error('Failed to delete file');
+    }
+    
+    this.fileCache.delete(name);
+  }
+
+  async listFiles(): Promise<Array<{name: string, uri: string}>> {
+    const response = await fetch(
+      `${GeminiService.FILE_API_ENDPOINT}?key=${this.genAI.apiKey}`
+    );
+
+    if (!response.ok) {
+      throw new Error('Failed to list files');
+    }
+
+    const data = await response.json();
+    return data.files;
   }
 }
 
